@@ -1,0 +1,144 @@
+name: Build Windows PyCOLMAP wheel
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wheel:
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      VCPKG_DIR: ${{ runner.temp }}/vcpkg
+      VCPKG_COMMIT: 9b75e789ece3f942159b8500584e35aafe3979ff
+      VCPKG_TRIPLET: x64-windows-release
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/vcpkg-cache,readwrite
+      COLMAP_BUILD: ${{ runner.temp }}/colmap-build
+      COLMAP_PREFIX: ${{ runner.temp }}/colmap-prefix
+      CMAKE_BUILD_PARALLEL_LEVEL: '2'
+      NVCC_APPEND_FLAGS: -allow-unsupported-compiler -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH
+      CL: -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          architecture: x64
+
+      - uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: '12.4.0'
+          method: network
+          use-github-cache: false
+          sub-packages: '["nvcc","cudart","thrust","visual_studio_integration","cublas_dev","cusparse_dev","cusolver_dev","curand_dev","nvrtc","nvrtc_dev"]'
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install wheel build tools
+        run: python -m pip install "cmake>=3.28,<4" ninja build delvewheel
+
+      - name: Restore vcpkg cache
+        uses: actions/cache@v4
+        with:
+          path: vcpkg-cache
+          key: pycolmap-${{ runner.os }}-${{ env.VCPKG_TRIPLET }}-${{ env.VCPKG_COMMIT }}-cu124-${{ hashFiles('vcpkg.json') }}
+
+      - name: Bootstrap vcpkg
+        run: |
+          New-Item -ItemType Directory -Force vcpkg-cache | Out-Null
+          git init "$env:VCPKG_DIR"
+          if ($LASTEXITCODE -ne 0) { throw "git init failed" }
+          git -C "$env:VCPKG_DIR" fetch --depth 1 https://github.com/microsoft/vcpkg.git "$env:VCPKG_COMMIT"
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg fetch failed" }
+          git -C "$env:VCPKG_DIR" checkout --detach FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg checkout failed" }
+          & "$env:VCPKG_DIR/bootstrap-vcpkg.bat" -disableMetrics
+
+      - name: Build the native COLMAP libraries
+        run: |
+          # Keep colmap_exe, the library required by the Python bindings.
+          # Skip colmap_main, the standalone executable, in this checkout.
+          $cliCmake = 'src/colmap/exe/CMakeLists.txt'
+          $source = Get-Content $cliCmake -Raw
+          $cliTarget = [regex]::new('(?m)^COLMAP_ADD_EXECUTABLE\(\s+NAME colmap_main\b')
+          if ($cliTarget.Matches($source).Count -ne 1) {
+            throw "Could not locate the COLMAP executable target"
+          }
+          $source = $cliTarget.Replace($source, ('return()' + "`n`n" + '$0'), 1)
+          Set-Content -Path $cliCmake -Value $source -Encoding utf8
+
+          $configureArgs = @(
+            '-S', '.', '-B', $env:COLMAP_BUILD, '-G', 'Ninja'
+            '-DCMAKE_BUILD_TYPE=Release'
+            "-DCMAKE_INSTALL_PREFIX=$env:COLMAP_PREFIX"
+            "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_DIR/scripts/buildsystems/vcpkg.cmake"
+            "-DVCPKG_TARGET_TRIPLET=$env:VCPKG_TRIPLET"
+            '-DVCPKG_USE_LEGACY_APPLOCAL=ON'
+            '-DCUDA_ENABLED=ON'
+            "-DCMAKE_CUDA_COMPILER=$env:CUDA_PATH/bin/nvcc.exe"
+            '-DCMAKE_CUDA_ARCHITECTURES=86'
+            '-DGUI_ENABLED=OFF'
+            '-DCGAL_ENABLED=OFF'
+            '-DTESTS_ENABLED=OFF'
+          )
+          cmake @configureArgs
+          if ($LASTEXITCODE -ne 0) { throw "COLMAP configuration failed" }
+          cmake --build "$env:COLMAP_BUILD" --target install
+
+      - name: Build and repair the wheel
+        run: |
+          $installed = "$env:COLMAP_BUILD/vcpkg_installed"
+          $env:CMAKE_GENERATOR = 'Ninja'
+          $buildArgs = @(
+            '--wheel', '--outdir', 'dist'
+            "-Ccmake.define.colmap_DIR=$env:COLMAP_PREFIX/share/colmap"
+            "-Ccmake.define.CMAKE_TOOLCHAIN_FILE=$env:VCPKG_DIR/scripts/buildsystems/vcpkg.cmake"
+            "-Ccmake.define.VCPKG_TARGET_TRIPLET=$env:VCPKG_TRIPLET"
+            "-Ccmake.define.VCPKG_INSTALLED_DIR=$installed"
+            '-Ccmake.define.VCPKG_MANIFEST_MODE=OFF'
+            "-Ccmake.define.CMAKE_CUDA_COMPILER=$env:CUDA_PATH/bin/nvcc.exe"
+            '-Ccmake.define.CMAKE_CUDA_ARCHITECTURES=86'
+            "-Ccmake.define.CUDAToolkit_ROOT=$env:CUDA_PATH"
+          )
+          python -m build @buildArgs
+          if ($LASTEXITCODE -ne 0) { throw "PyCOLMAP wheel build failed" }
+
+          $wheels = @(Get-ChildItem dist/pycolmap-*-cp310-cp310-win_amd64.whl)
+          if ($wheels.Count -ne 1) { throw "Expected one CPython 3.10 x64 wheel" }
+          $dllPaths = "$installed/$env:VCPKG_TRIPLET/bin;$env:CUDA_PATH/bin"
+          python -m delvewheel repair --add-path "$dllPaths" -w wheelhouse "$($wheels[0].FullName)"
+
+      - name: Smoke-test the repaired wheel
+        run: |
+          $wheel = Get-ChildItem wheelhouse/pycolmap-*.whl | Select-Object -First 1
+          if (-not $wheel) { throw "Repaired wheel not found" }
+          $testEnv = "$env:RUNNER_TEMP/pycolmap-test"
+          python -m venv "$testEnv"
+          if ($LASTEXITCODE -ne 0) { throw "Could not create smoke-test environment" }
+          $testPython = "$testEnv/Scripts/python.exe"
+          & $testPython -m pip install "$($wheel.FullName)"
+          if ($LASTEXITCODE -ne 0) { throw "Could not install repaired wheel" }
+
+          # Remove the toolkit's DLL directory when testing the installed wheel.
+          $cudaBin = (Resolve-Path "$env:CUDA_PATH/bin").Path
+          $env:Path = ($env:Path -split ';' | Where-Object {
+            ($_ -replace '/', '\').TrimEnd('\') -ine $cudaBin.TrimEnd('\')
+          }) -join ';'
+          Set-Location "$env:RUNNER_TEMP"
+          & $testPython -c "import pycolmap; assert pycolmap.has_cuda, 'CUDA support missing'; print(pycolmap.__version__)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pycolmap-cu124-cp310-win64
+          path: wheelhouse/pycolmap-*.whl
+          if-no-files-found: error
