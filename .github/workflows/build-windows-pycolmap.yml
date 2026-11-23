@@ -13,17 +13,20 @@ jobs:
       run:
         shell: pwsh
     env:
-      VCPKG_DIR: ${{ runner.temp }}/vcpkg
       VCPKG_COMMIT: 9b75e789ece3f942159b8500584e35aafe3979ff
       VCPKG_TRIPLET: x64-windows-release
       VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/vcpkg-cache,readwrite
-      COLMAP_BUILD: ${{ runner.temp }}/colmap-build
-      COLMAP_PREFIX: ${{ runner.temp }}/colmap-prefix
       CMAKE_BUILD_PARALLEL_LEVEL: '2'
       NVCC_APPEND_FLAGS: -allow-unsupported-compiler -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH
       CL: -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH
 
     steps:
+      - name: Set temporary build paths
+        run: |
+          "VCPKG_DIR=$env:RUNNER_TEMP/vcpkg" >> $env:GITHUB_ENV
+          "COLMAP_BUILD=$env:RUNNER_TEMP/colmap-build" >> $env:GITHUB_ENV
+          "COLMAP_PREFIX=$env:RUNNER_TEMP/colmap-prefix" >> $env:GITHUB_ENV
+
       - uses: actions/checkout@v4
         with:
           submodules: recursive
@@ -58,16 +61,19 @@ jobs:
           New-Item -ItemType Directory -Force vcpkg-cache | Out-Null
           git init "$env:VCPKG_DIR"
           if ($LASTEXITCODE -ne 0) { throw "git init failed" }
+
           git -C "$env:VCPKG_DIR" fetch --depth 1 https://github.com/microsoft/vcpkg.git "$env:VCPKG_COMMIT"
           if ($LASTEXITCODE -ne 0) { throw "vcpkg fetch failed" }
+
           git -C "$env:VCPKG_DIR" checkout --detach FETCH_HEAD
           if ($LASTEXITCODE -ne 0) { throw "vcpkg checkout failed" }
+
           & "$env:VCPKG_DIR/bootstrap-vcpkg.bat" -disableMetrics
 
       - name: Build the native COLMAP libraries
         run: |
-          # Keep colmap_exe, the library required by the Python bindings.
-          # Skip colmap_main, the standalone executable, in this checkout.
+          # Keep colmap_exe, the library used by the bindings.
+          # Skip colmap_main, the standalone executable, in the CI checkout.
           $cliCmake = 'src/colmap/exe/CMakeLists.txt'
           $source = Get-Content $cliCmake -Raw
           $cliTarget = [regex]::new('(?m)^COLMAP_ADD_EXECUTABLE\(\s+NAME colmap_main\b')
@@ -93,6 +99,7 @@ jobs:
           )
           cmake @configureArgs
           if ($LASTEXITCODE -ne 0) { throw "COLMAP configuration failed" }
+
           cmake --build "$env:COLMAP_BUILD" --target install
 
       - name: Build and repair the wheel
@@ -114,7 +121,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "PyCOLMAP wheel build failed" }
 
           $wheels = @(Get-ChildItem dist/pycolmap-*-cp310-cp310-win_amd64.whl)
-          if ($wheels.Count -ne 1) { throw "Expected one CPython 3.10 x64 wheel" }
+          if ($wheels.Count -ne 1) {
+            throw "Expected one CPython 3.10 x64 wheel"
+          }
+
           $dllPaths = "$installed/$env:VCPKG_TRIPLET/bin;$env:CUDA_PATH/bin"
           python -m delvewheel repair --add-path "$dllPaths" -w wheelhouse "$($wheels[0].FullName)"
 
@@ -122,18 +132,21 @@ jobs:
         run: |
           $wheel = Get-ChildItem wheelhouse/pycolmap-*.whl | Select-Object -First 1
           if (-not $wheel) { throw "Repaired wheel not found" }
+
           $testEnv = "$env:RUNNER_TEMP/pycolmap-test"
           python -m venv "$testEnv"
           if ($LASTEXITCODE -ne 0) { throw "Could not create smoke-test environment" }
+
           $testPython = "$testEnv/Scripts/python.exe"
           & $testPython -m pip install "$($wheel.FullName)"
           if ($LASTEXITCODE -ne 0) { throw "Could not install repaired wheel" }
 
-          # Remove the toolkit's DLL directory when testing the installed wheel.
+          # Test the installed wheel without the CUDA toolkit's DLL directory on PATH.
           $cudaBin = (Resolve-Path "$env:CUDA_PATH/bin").Path
           $env:Path = ($env:Path -split ';' | Where-Object {
             ($_ -replace '/', '\').TrimEnd('\') -ine $cudaBin.TrimEnd('\')
           }) -join ';'
+
           Set-Location "$env:RUNNER_TEMP"
           & $testPython -c "import pycolmap; assert pycolmap.has_cuda, 'CUDA support missing'; print(pycolmap.__version__)"
 
