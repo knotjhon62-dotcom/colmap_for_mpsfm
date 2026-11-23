@@ -70,10 +70,28 @@ jobs:
 
           & "$env:VCPKG_DIR/bootstrap-vcpkg.bat" -disableMetrics
 
+      - name: Install MSYS2 pkg-config
+        id: msys2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: mingw-w64-x86_64-pkgconf
+
+      - name: Set pkg-config for vcpkg
+        env:
+          MSYS2_LOCATION: ${{ steps.msys2.outputs.msys2-location }}
+        run: |
+          $pkgConfig = Join-Path $env:MSYS2_LOCATION 'mingw64/bin/pkg-config.exe'
+          & $pkgConfig --version
+          if ($LASTEXITCODE -ne 0) { throw "pkg-config failed to start" }
+
+          "PKG_CONFIG=$pkgConfig" >> $env:GITHUB_ENV
+          "VCPKG_KEEP_ENV_VARS=PKG_CONFIG" >> $env:GITHUB_ENV
+
       - name: Build the native COLMAP libraries
         run: |
-          # Keep colmap_exe, the library used by the bindings.
-          # Skip colmap_main, the standalone executable, in the CI checkout.
+          # Keep the colmap_exe library and skip the standalone colmap_main target.
           $cliCmake = 'src/colmap/exe/CMakeLists.txt'
           $source = Get-Content $cliCmake -Raw
           $cliTarget = [regex]::new('(?m)^COLMAP_ADD_EXECUTABLE\(\s+NAME colmap_main\b')
@@ -141,7 +159,7 @@ jobs:
           & $testPython -m pip install "$($wheel.FullName)"
           if ($LASTEXITCODE -ne 0) { throw "Could not install repaired wheel" }
 
-          # Test the installed wheel without the CUDA toolkit's DLL directory on PATH.
+          # Remove the CUDA toolkit's DLL directory from PATH for the import test.
           $cudaBin = (Resolve-Path "$env:CUDA_PATH/bin").Path
           $env:Path = ($env:Path -split ';' | Where-Object {
             ($_ -replace '/', '\').TrimEnd('\') -ine $cudaBin.TrimEnd('\')
