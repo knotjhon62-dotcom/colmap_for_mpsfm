@@ -70,24 +70,45 @@ jobs:
 
           & "$env:VCPKG_DIR/bootstrap-vcpkg.bat" -disableMetrics
 
-      - name: Install MSYS2 pkg-config
+      - name: Install MSYS2 build tools
         id: msys2
         uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
           update: true
-          install: mingw-w64-x86_64-pkgconf
+          install: >-
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-gcc-fortran
 
-      - name: Set pkg-config for vcpkg
+      - name: Configure MSYS2 tools for vcpkg
         env:
           MSYS2_LOCATION: ${{ steps.msys2.outputs.msys2-location }}
         run: |
-          $pkgConfig = Join-Path $env:MSYS2_LOCATION 'mingw64/bin/pkg-config.exe'
+          $msysRoot = (Resolve-Path $env:MSYS2_LOCATION).Path.Replace('\', '/')
+          $pkgConfig = "$msysRoot/mingw64/bin/pkg-config.exe"
+          $gfortran = "$msysRoot/mingw64/bin/gfortran.exe"
+
           & $pkgConfig --version
           if ($LASTEXITCODE -ne 0) { throw "pkg-config failed to start" }
 
+          & $gfortran --version
+          if ($LASTEXITCODE -ne 0) { throw "gfortran failed to start" }
+
           "PKG_CONFIG=$pkgConfig" >> $env:GITHUB_ENV
           "VCPKG_KEEP_ENV_VARS=PKG_CONFIG" >> $env:GITHUB_ENV
+
+          # Use the installed MSYS2 toolchain for vcpkg's x64 Fortran fallback.
+          $helper = "$env:VCPKG_DIR/scripts/cmake/vcpkg_find_fortran.cmake"
+          $source = Get-Content $helper -Raw
+          $download = [regex]::new(
+            'vcpkg_acquire_msys\(msys_root\s+NO_DEFAULT_PACKAGES\s+Z_DECLARE_EXTRA_PACKAGES_COMMAND\s+"z_vcpkg_find_fortran_msys_declare_packages"\s+PACKAGES\s+mingw-w64-x86_64-gcc-fortran\s*\)'
+          )
+          if ($download.Matches($source).Count -ne 1) {
+            throw "Could not locate the pinned vcpkg x64 Fortran download"
+          }
+
+          $replacement = 'set(msys_root "' + $msysRoot + '")'
+          Set-Content -Path $helper -Value ($download.Replace($source, $replacement, 1)) -Encoding utf8
 
       - name: Build the native COLMAP libraries
         run: |
@@ -98,6 +119,7 @@ jobs:
           if ($cliTarget.Matches($source).Count -ne 1) {
             throw "Could not locate the COLMAP executable target"
           }
+
           $source = $cliTarget.Replace($source, ('return()' + "`n`n" + '$0'), 1)
           Set-Content -Path $cliCmake -Value $source -Encoding utf8
 
@@ -159,7 +181,7 @@ jobs:
           & $testPython -m pip install "$($wheel.FullName)"
           if ($LASTEXITCODE -ne 0) { throw "Could not install repaired wheel" }
 
-          # Remove the CUDA toolkit's DLL directory from PATH for the import test.
+          # Test the installed wheel with the CUDA toolkit's DLL directory removed from PATH.
           $cudaBin = (Resolve-Path "$env:CUDA_PATH/bin").Path
           $env:Path = ($env:Path -split ';' | Where-Object {
             ($_ -replace '/', '\').TrimEnd('\') -ine $cudaBin.TrimEnd('\')
